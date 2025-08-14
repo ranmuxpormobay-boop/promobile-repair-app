@@ -650,5 +650,163 @@ loadIntoForm = async function(jobId){
   await _loadIntoForm(jobId);
 };
 </script>
+<script>
+/*** ตั้งค่า ***/
+const API = 'https://script.google.com/macros/s/AKfycbwNLWwkdBc-Gl0o29kIa7wVkEAVFFe4fpSsgM14nqw1vaydma8N13jwgEp8ifaHR0fo/exec';
+
+const $  = (sel) => document.querySelector(sel);
+const form = document.getElementById('jobForm');
+const elTotal = document.getElementById('grandTotal');
+const elNote  = document.getElementById('estNote');
+
+let currentJobId = ''; // เก็บ JobID ล่าสุดหลังบันทึก
+
+/*** ช่วยคำนวณ & เก็บค่าจากฟอร์ม ***/
+function n(x){ const v = parseFloat(x); return isNaN(v)?0:v; }
+function readForm(){
+  const fd = new FormData(form);
+  const o = Object.fromEntries(fd.entries());
+  o.parts_cost = n(o.parts_cost);
+  o.labor_cost = n(o.labor_cost);
+  o.other_cost = n(o.other_cost);
+  o.deposit    = n(o.deposit);
+  o.total      = o.parts_cost + o.labor_cost + o.other_cost;
+  o.balance    = o.total - o.deposit;
+  // map ช่องที่โค้ด Apps Script ใช้
+  return {
+    customer_name:  o.customer_name || '',
+    customer_phone: o.customer_phone || '',
+    brand:          o.brand || '',
+    model:          o.model || '',
+    imei:           o.imei || '',
+    issue:          o.issue || '',
+    accessories:    o.accessories || '',
+    passcode:       o.passcode || '',
+    parts_cost:     o.parts_cost,
+    labor_cost:     o.labor_cost,
+    other_cost:     o.other_cost,
+    deposit:        o.deposit,
+    total:          o.total,
+    balance:        o.balance,
+    status:        'OPEN'
+  };
+}
+function refreshTotal(){
+  const d = readForm();
+  elTotal.textContent = d.total.toLocaleString();
+}
+
+/*** ยิงไปที่ Apps Script (หลบ CORS ง่าย ๆ ด้วย form-encoded) ***/
+async function apiPost(action, data){
+  const body = new URLSearchParams({ action, data: JSON.stringify(data||{}) });
+  const res = await fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+    body
+  });
+  // ถ้า deploy ถูก (Anyone) จะอ่าน JSON ได้เลย
+  const j = await res.json();
+  if(!j.ok) throw new Error(j.error || 'API error');
+  return j;
+}
+
+/*** ปุ่มบันทึก ***/
+document.getElementById('btnSave').addEventListener('click', async () => {
+  try{
+    const btn = document.getElementById('btnSave');
+    btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
+    const data = readForm();
+    const j = await apiPost('createrepair', data); // ไม่ส่ง job_id ก็ได้ ระบบจะ gen ให้
+    currentJobId = j.job_id || '';
+    alert('บันทึกสำเร็จ! เลขใบงาน: ' + (currentJobId||'-'));
+    btn.textContent = '💾 บันทึกใบแจ้งซ่อม';
+    btn.disabled = false;
+  }catch(err){
+    alert('บันทึกล้มเหลว: ' + err.message);
+    const btn = document.getElementById('btnSave');
+    btn.textContent = '💾 บันทึกใบแจ้งซ่อม';
+    btn.disabled = false;
+  }
+});
+
+/*** ปุ่มอัปเดต (ต้องมี JobID จากการบันทึกครั้งแรก) ***/
+document.getElementById('btnUpdate').addEventListener('click', async (e) => {
+  e.preventDefault();
+  try{
+    if(!currentJobId){
+      const ask = prompt('ยังไม่มี JobID ในหน้านี้ กรุณาพิมพ์ JobID ที่ต้องการอัปเดต');
+      if(!ask) return;
+      currentJobId = ask.trim();
+    }
+    const data = readForm();
+    data.job_id = currentJobId;
+    const j = await apiPost('updaterepair', data);
+    alert('อัปเดตสำเร็จ #' + j.job_id);
+  }catch(err){
+    alert('อัปเดตล้มเหลว: ' + err.message);
+  }
+});
+
+/*** ปุ่มพิมพ์ ***/
+document.getElementById('btnPrint').addEventListener('click', () => {
+  window.print();
+});
+
+/*** ปุ่มคำนวณประมาณการจากแท็บ RepairBaseline (ถ้ามี) ***/
+document.getElementById('btnEstimate').addEventListener('click', async () => {
+  try{
+    const brand = ($('[name=brand]').value||'').toLowerCase();
+    const model = ($('[name=model]').value||'').toLowerCase();
+    const issue = ($('[name=issue]').value||'').toLowerCase();
+
+    // ดึงฐานข้อมูลแบบ GET
+    const url = API + '?action=repairbaseline';
+    const res = await fetch(url);
+    const j = await res.json();
+    if(!j.ok) throw new Error('อ่านฐานราคาไม่ได้');
+
+    const rows = j.rows || [];
+    // โครงคอลัมน์ในชีต: Brand, Model, Issue, PartsMin, PartsMax, Labor, Note
+    const matchs = rows.filter(r=>{
+      const b = String(r.Brand||'').toLowerCase();
+      const m = String(r.Model||'').toLowerCase();
+      const i = String(r.Issue||'').toLowerCase();
+      return (!brand || b.includes(brand)) &&
+             (!model || m.includes(model)) &&
+             (!issue || i.includes(issue));
+    });
+
+    if(matchs.length === 0){
+      elNote.textContent = 'ไม่มีฐานราคาตรงรุ่น/อาการนี้ จะใช้ค่าที่คุณกรอกเอง';
+      return;
+    }
+
+    // ถัวเฉลี่ย Labor และคืน min/max อะไหล่
+    const partsMin = Math.min(...matchs.map(r => Number(r.PartsMin||0)));
+    const partsMax = Math.max(...matchs.map(r => Number(r.PartsMax||0)));
+    const laborAvg = Math.round(
+      matchs.reduce((s,r)=> s + Number(r.Labor||0), 0) / matchs.length
+    );
+
+    // ใส่ลงฟอร์ม: ตั้งค่าอะไหล่เป็นค่าเฉลี่ยช่วง, ค่าแรงเป็นค่าเฉลี่ย
+    const mid = Math.round((partsMin + partsMax)/2);
+    $('[name=parts_cost]').value = mid;
+    $('[name=labor_cost]').value = laborAvg;
+    refreshTotal();
+
+    // หมายเหตุ
+    const note = matchs.find(r=>r.Note)?.Note || '';
+    elNote.innerHTML = `ช่วงอะไหล่ประมาณ ${partsMin.toLocaleString()} - ${partsMax.toLocaleString()} บาท, ค่าแรงเฉลี่ย ~ ${laborAvg.toLocaleString()} บาท` + (note? ` (${note})` : '');
+  }catch(err){
+    elNote.textContent = 'คำนวณไม่ได้: ' + err.message;
+  }
+});
+
+/*** อัปเดตรวมเงินแบบเรียลไทม์ ***/
+['parts_cost','labor_cost','other_cost','deposit'].forEach(nm=>{
+  $(`[name=${nm}]`).addEventListener('input', refreshTotal);
+});
+refreshTotal();
+</script>
 </body>
 </html>
